@@ -5,6 +5,7 @@ import { isValidObjectId, Model } from 'mongoose';
 import { randomUUID } from 'crypto';
 import { RekognitionService } from '../common/rekognition.service';
 import { S3Service } from '../common/s3.service';
+import { TextModerationService } from '../common/text-moderation.service';
 import { Circle, CirclePost } from '../circles/circle.entity';
 import { ActorAuthService } from '../shared/auth/actor-auth.service';
 import { createDomainEvent, DOMAIN_EVENT_TYPES } from '../shared/contracts/domain-events';
@@ -26,11 +27,37 @@ export class WallService {
     @InjectModel(CirclePost.name) private readonly circlePostModel: Model<any>,
     private readonly s3Service: S3Service,
     private readonly rekognitionService: RekognitionService,
+    private readonly textModerationService: TextModerationService,
     private readonly userAccountService: UserAccountService,
     private readonly advertisementPlacementService: AdvertisementPlacementService,
     private readonly actorAuthService: ActorAuthService,
     private readonly eventPublisher: EventPublisherService,
   ) {}
+
+  // Called by user-service whenever a user changes their avatar, so existing
+  // posts/comments (which store a denormalized authorAvatar for fast feed
+  // reads) reflect the new picture instead of staying frozen at post time.
+  async updateAuthorAvatarEverywhere(userId: string, avatarUrl: string) {
+    await Promise.all([
+      this.wallPostModel.updateMany({ userId }, { $set: { authorAvatar: avatarUrl } }).exec(),
+      this.wallPostModel
+        .updateMany(
+          { 'comments.userId': userId },
+          { $set: { 'comments.$[c].authorAvatar': avatarUrl } },
+          { arrayFilters: [{ 'c.userId': userId }] },
+        )
+        .exec(),
+      this.wallPostModel
+        .updateMany(
+          { 'imageEngagement.comments.userId': userId },
+          { $set: { 'imageEngagement.$[].comments.$[c].authorAvatar': avatarUrl } },
+          { arrayFilters: [{ 'c.userId': userId }] },
+        )
+        .exec(),
+      this.circlePostModel.updateMany({ userId }, { $set: { authorAvatar: avatarUrl } }).exec(),
+    ]);
+    return { ok: true };
+  }
 
     getNumericEnv(name, fallback) {
         const raw = Number(process.env[name]);
@@ -813,6 +840,10 @@ export class WallService {
             !dto.imageUrl) {
             throw new BadRequestException('Post must have a caption, an image, or a video.');
         }
+        const captionModeration = this.textModerationService.check(dto.caption);
+        if (captionModeration.blocked) {
+            throw new BadRequestException(captionModeration.reason);
+        }
         const imageUrls = videoUrl ? [] : (dto.imageUrls && dto.imageUrls.length ? dto.imageUrls : []);
         if (!imageUrls.length && dto.imageUrl && !videoUrl) {
             imageUrls.push(dto.imageUrl);
@@ -854,10 +885,7 @@ export class WallService {
         await this.eventPublisher.publish(createDomainEvent(DOMAIN_EVENT_TYPES.wallPostCreated, {
             postId: post._id.toString(),
         }));
-        return {
-            post: await this.enrichSinglePostWithAuthorMeta(post.toObject()),
-            pointsAwarded: points,
-        };
+        return this.enrichSinglePostWithAuthorMeta(post.toObject());
     }
     normalizeLegacyComments(post) {
         if (!post.comments?.length)
@@ -1012,6 +1040,12 @@ export class WallService {
         if (!nextCaption && !hasImages && !hasVideo) {
             throw new BadRequestException('Post must have a caption, an image, or a video.');
         }
+        if (typeof dto.caption === 'string') {
+            const captionModeration = this.textModerationService.check(nextCaption);
+            if (captionModeration.blocked) {
+                throw new BadRequestException(captionModeration.reason);
+            }
+        }
         if (!hasVideo && nextImageUrls.length) {
             for (const url of nextImageUrls) {
                 const key = this.s3Service.parseKeyFromUrl(url);
@@ -1105,6 +1139,10 @@ export class WallService {
         const post = await this.wallPostModel.findById(postId);
         if (!post)
             throw new NotFoundException('Post not found');
+        const commentModeration = this.textModerationService.check(dto.text);
+        if (commentModeration.blocked) {
+            throw new BadRequestException(commentModeration.reason);
+        }
         if (typeof dto.imageIndex === 'number') {
             const imageEngagement = this.getImageEngagement(post, dto.imageIndex);
             imageEngagement.comments = imageEngagement.comments || [];

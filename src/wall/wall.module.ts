@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { RekognitionService } from '../common/rekognition.service';
 import { S3Service } from '../common/s3.service';
+import { TextModerationService } from '../common/text-moderation.service';
 import {
   Circle,
   CirclePost,
@@ -37,7 +38,7 @@ import { WallViewEvent, WallViewEventSchema } from './wall-view-event.entity';
     SharedEventsModule,
   ],
   controllers: [WallController],
-  providers: [WallService, S3Service, RekognitionService, MembershipGuardService],
+  providers: [WallService, S3Service, RekognitionService, TextModerationService, MembershipGuardService],
   exports: [WallService],
 })
 export class WallModule {}

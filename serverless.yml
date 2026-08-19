@@ -22,6 +22,7 @@ provider:
     COGNITO_USER_POOL_ID: ${env:COGNITO_USER_POOL_ID}
     COGNITO_CLIENT_ID: ${env:COGNITO_CLIENT_ID}
     WALL_RANKING_DEBUG: ${env:WALL_RANKING_DEBUG, 'false'}
+    PAYLOAD_ENCRYPTION_KEY: ${env:PAYLOAD_ENCRYPTION_KEY}
 
   iam:
     role:
@@ -48,6 +49,7 @@ provider:
       allowedHeaders:
         - Content-Type
         - Authorization
+        - X-Encrypted
       allowedMethods:
         - GET
         - POST

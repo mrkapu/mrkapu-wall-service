@@ -59,6 +59,16 @@ export class WallController {
     return this.wallService.createPost(actorId, dto);
   }
 
+  // Called by user-service when a user's avatarUrl changes, to backfill
+  // their existing posts/comments (see PROJECT_LOG.md, 2026-07-25).
+  @Patch('internal/authors/:userId/avatar')
+  async updateAuthorAvatar(
+    @Param('userId') userId: string,
+    @Body() body: { avatarUrl: string },
+  ) {
+    return this.wallService.updateAuthorAvatarEverywhere(userId, body.avatarUrl);
+  }
+
   @Patch('posts/:id')
   async editPost(
     @Headers('authorization') authorization: string,
