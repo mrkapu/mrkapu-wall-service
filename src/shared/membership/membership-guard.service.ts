@@ -1,4 +1,4 @@
-import { ForbiddenException, Injectable } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument, Model } from 'mongoose';
@@ -6,28 +6,14 @@ import { HydratedDocument, Model } from 'mongoose';
 @Schema({ collection: 'auth_users' })
 export class UserRef {
   @Prop() account_type?: string;
-  @Prop() membership_tier?: string;
-  @Prop() membership_expires_at?: Date;
+  @Prop() personal_tier?: string;
+  @Prop() personal_tier_expires_at?: Date;
+  @Prop() service_tier?: string;
+  @Prop() service_tier_expires_at?: Date;
 }
 
 export type UserRefDocument = HydratedDocument<UserRef>;
 export const UserRefSchema = SchemaFactory.createForClass(UserRef);
-
-// Tiers are per-track — premium belongs to user track, platinum to service_account track.
-// A silver service account must never satisfy a premium requirement, and vice versa.
-const TRACK_OF: Record<string, string> = {
-  free: 'user',
-  premium: 'user',
-  silver: 'service_account',
-  platinum: 'service_account',
-};
-
-const TIER_RANK: Record<string, number> = {
-  free: 0,
-  premium: 1,
-  silver: 0,
-  platinum: 1,
-};
 
 export interface UserMembership {
   accountType: string;
@@ -43,56 +29,43 @@ export class MembershipGuardService {
   async getMembership(userId: string): Promise<UserMembership | null> {
     const user = await this.userRefModel
       .findById(userId)
-      .select('account_type membership_tier membership_expires_at')
+      .select('account_type personal_tier personal_tier_expires_at service_tier service_tier_expires_at')
       .lean()
       .exec();
 
     if (!user) return null;
 
     const accountType = user.account_type || 'user';
-    const expiresAt = user.membership_expires_at;
+    const isService = accountType === 'service_account';
+    // Tiers live in separate fields per track — service_tier for vendors,
+    // personal_tier for everyone else. There is no single shared
+    // "membership_tier" field on the User doc (mrkapu-user-service never
+    // writes one); reading per-track fields directly here, rather than a
+    // field that's always empty, is the fix.
+    const tier = isService ? user.service_tier : user.personal_tier;
+    const expiresAt = isService ? user.service_tier_expires_at : user.personal_tier_expires_at;
+    const defaultTier = isService ? 'default' : 'free';
     const isExpired = expiresAt ? new Date(expiresAt) < new Date() : false;
-    const defaultTier = accountType === 'service_account' ? 'silver' : 'free';
-    const effectiveTier = isExpired ? defaultTier : (user.membership_tier || defaultTier);
+    const effectiveTier = isExpired ? defaultTier : (tier || defaultTier);
 
     return { accountType, effectiveTier };
   }
 
-  async requireTier(userId: string, requiredTier: string, feature: string): Promise<void> {
+  // Video is exclusive to vendor/service-provider accounts — no personal
+  // tier (free/silver/premium) may post video, regardless of tier.
+  async canPostVideo(userId: string): Promise<boolean> {
     const membership = await this.getMembership(userId);
-    if (!membership) return;
-
-    const { accountType, effectiveTier } = membership;
-
-    // Track mismatch: a service_account can never satisfy a user-track requirement and vice versa.
-    const requiredTrack = TRACK_OF[requiredTier];
-    if (requiredTrack && requiredTrack !== accountType) {
-      throw new ForbiddenException({
-        error: 'UPGRADE_REQUIRED',
-        requiredTier,
-        feature,
-      });
-    }
-
-    const effectiveRank = TIER_RANK[effectiveTier] ?? 0;
-    const requiredRank = TIER_RANK[requiredTier] ?? 0;
-
-    if (effectiveRank < requiredRank) {
-      throw new ForbiddenException({
-        error: 'UPGRADE_REQUIRED',
-        requiredTier,
-        feature,
-      });
-    }
+    return membership?.accountType === 'service_account';
   }
 
-  // Returns max allowed video duration in seconds for the personal wall.
-  async getMaxVideoDurationSec(userId: string): Promise<number> {
+  // Daily wall-post cap for personal accounts. null = unlimited.
+  // free -> 0 (blocked entirely), silver -> 10/day, premium -> unlimited.
+  // Service accounts (vendors) are unaffected by this cap.
+  async getDailyPostLimit(userId: string): Promise<number | null> {
     const membership = await this.getMembership(userId);
-    if (!membership) return 30;
-    if (membership.accountType === 'user' && membership.effectiveTier === 'premium') {
-      return 180;
-    }
-    return 30;
+    if (!membership || membership.accountType === 'service_account') return null;
+    if (membership.effectiveTier === 'premium') return null;
+    if (membership.effectiveTier === 'silver') return 10;
+    return 0;
   }
 }

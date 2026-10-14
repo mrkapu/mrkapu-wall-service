@@ -34,27 +34,41 @@ export class WallService {
     private readonly eventPublisher: EventPublisherService,
   ) {}
 
-  // Called by user-service whenever a user changes their avatar, so existing
-  // posts/comments (which store a denormalized authorAvatar for fast feed
-  // reads) reflect the new picture instead of staying frozen at post time.
-  async updateAuthorAvatarEverywhere(userId: string, avatarUrl: string) {
+  // Called by user-service whenever a user changes their avatar and/or name,
+  // so existing posts/comments (which store a denormalized authorAvatar /
+  // authorName for fast feed reads) reflect the update instead of staying
+  // frozen at post time. Only the fields actually passed get updated.
+  async syncAuthorProfileEverywhere(userId: string, changes: { avatarUrl?: string; authorName?: string }) {
+    const postSet: Record<string, string> = {};
+    if (changes.avatarUrl !== undefined) postSet.authorAvatar = changes.avatarUrl;
+    if (changes.authorName !== undefined) postSet.authorName = changes.authorName;
+    if (Object.keys(postSet).length === 0) return { ok: true };
+
+    const commentSet: Record<string, string> = {};
+    if (changes.avatarUrl !== undefined) commentSet['comments.$[c].authorAvatar'] = changes.avatarUrl;
+    if (changes.authorName !== undefined) commentSet['comments.$[c].authorName'] = changes.authorName;
+
+    const imageCommentSet: Record<string, string> = {};
+    if (changes.avatarUrl !== undefined) imageCommentSet['imageEngagement.$[].comments.$[c].authorAvatar'] = changes.avatarUrl;
+    if (changes.authorName !== undefined) imageCommentSet['imageEngagement.$[].comments.$[c].authorName'] = changes.authorName;
+
     await Promise.all([
-      this.wallPostModel.updateMany({ userId }, { $set: { authorAvatar: avatarUrl } }).exec(),
+      this.wallPostModel.updateMany({ userId }, { $set: postSet }).exec(),
       this.wallPostModel
         .updateMany(
           { 'comments.userId': userId },
-          { $set: { 'comments.$[c].authorAvatar': avatarUrl } },
+          { $set: commentSet },
           { arrayFilters: [{ 'c.userId': userId }] },
         )
         .exec(),
       this.wallPostModel
         .updateMany(
           { 'imageEngagement.comments.userId': userId },
-          { $set: { 'imageEngagement.$[].comments.$[c].authorAvatar': avatarUrl } },
+          { $set: imageCommentSet },
           { arrayFilters: [{ 'c.userId': userId }] },
         )
         .exec(),
-      this.circlePostModel.updateMany({ userId }, { $set: { authorAvatar: avatarUrl } }).exec(),
+      this.circlePostModel.updateMany({ userId }, { $set: postSet }).exec(),
     ]);
     return { ok: true };
   }
@@ -217,19 +231,31 @@ export class WallService {
                 .exec();
         }
     }
-    buildPostsFilter(tag) {
-        const filter = {};
-        if (!tag?.trim())
-            return filter;
-        const normalizedTag = this.normalizeTag(tag);
-        if (!normalizedTag) {
-            return { _id: { $exists: false } };
+    escapeRegExp(raw) {
+        return raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+    buildPostsFilter(tag, authorName) {
+        const clauses = [];
+        if (tag?.trim()) {
+            const normalizedTag = this.normalizeTag(tag);
+            if (!normalizedTag) {
+                return { _id: { $exists: false } };
+            }
+            clauses.push({
+                $or: [
+                    { tags: normalizedTag },
+                    { caption: new RegExp(`(^|\\s)#${normalizedTag}(\\b|\\s|$)`, 'i') },
+                ],
+            });
         }
-        filter.$or = [
-            { tags: normalizedTag },
-            { caption: new RegExp(`(^|\\s)#${normalizedTag}(\\b|\\s|$)`, 'i') },
-        ];
-        return filter;
+        if (authorName?.trim()) {
+            clauses.push({
+                authorName: new RegExp(this.escapeRegExp(authorName.trim()), 'i'),
+            });
+        }
+        if (!clauses.length)
+            return {};
+        return clauses.length === 1 ? clauses[0] : { $and: clauses };
     }
     sanitizeListSort(sort) {
         return sort?.trim().toLowerCase() == 'trending' ? 'trending' : 'recent';
@@ -827,6 +853,14 @@ export class WallService {
         }
         return selected;
     }
+    async countPostsToday(actorId) {
+        const startOfToday = new Date();
+        startOfToday.setHours(0, 0, 0, 0);
+        return this.wallPostModel.countDocuments({
+            userId: actorId,
+            createdAt: { $gte: startOfToday },
+        });
+    }
     async createPost(actorId, dto) {
         const videoUrl = dto.videoUrl?.trim();
         const videoThumbnailUrl = dto.videoThumbnailUrl?.trim();
@@ -943,10 +977,10 @@ export class WallService {
         imageEngagement.updatedAt = new Date();
         return imageEngagement;
     }
-    async listPosts(limit = 20, offset = 0, tag, sort, viewerId) {
+    async listPosts(limit = 20, offset = 0, tag, sort, viewerId, authorName) {
         const safeLimit = Math.max(1, Math.min(limit, 50));
         const safeOffset = Math.max(0, Number.isFinite(offset) ? offset : 0);
-        const filter = this.buildPostsFilter(tag);
+        const filter = this.buildPostsFilter(tag, authorName);
         const sortMode = this.sanitizeListSort(sort);
         const candidateLimit = sortMode === 'trending'
             ? Math.min(150, Math.max(safeLimit * 3, safeLimit + 10))

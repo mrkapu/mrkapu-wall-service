@@ -3,6 +3,7 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   Headers,
   Logger,
@@ -50,23 +51,37 @@ export class WallController {
     @Body() dto: CreateWallPostDto,
   ) {
     const actorId = this.wallService.getActorIdFromAuth(authorization);
-    if (dto.videoDurationSec && dto.videoDurationSec > 0) {
-      const maxSec = await this.membershipGuard.getMaxVideoDurationSec(actorId);
-      if (dto.videoDurationSec > maxSec) {
-        await this.membershipGuard.requireTier(actorId, 'premium', 'video_duration');
+    if (dto.videoUrl?.trim() && !(await this.membershipGuard.canPostVideo(actorId))) {
+      throw new ForbiddenException({
+        error: 'UPGRADE_REQUIRED',
+        reason: 'video_requires_service_account',
+      });
+    }
+    const dailyLimit = await this.membershipGuard.getDailyPostLimit(actorId);
+    if (dailyLimit !== null) {
+      const postedToday = await this.wallService.countPostsToday(actorId);
+      if (dailyLimit === 0) {
+        throw new ForbiddenException({ error: 'UPGRADE_REQUIRED', reason: 'upgrade_to_post' });
+      }
+      if (postedToday >= dailyLimit) {
+        throw new ForbiddenException({
+          error: 'UPGRADE_REQUIRED',
+          reason: 'daily_post_limit_reached',
+          limit: dailyLimit,
+        });
       }
     }
     return this.wallService.createPost(actorId, dto);
   }
 
-  // Called by user-service when a user's avatarUrl changes, to backfill
-  // their existing posts/comments (see PROJECT_LOG.md, 2026-07-25).
-  @Patch('internal/authors/:userId/avatar')
-  async updateAuthorAvatar(
+  // Called by user-service when a user's avatarUrl and/or name changes, to
+  // backfill their existing posts/comments (see PROJECT_LOG.md, 2026-07-25).
+  @Patch('internal/authors/:userId')
+  async syncAuthorProfile(
     @Param('userId') userId: string,
-    @Body() body: { avatarUrl: string },
+    @Body() body: { avatarUrl?: string; authorName?: string },
   ) {
-    return this.wallService.updateAuthorAvatarEverywhere(userId, body.avatarUrl);
+    return this.wallService.syncAuthorProfileEverywhere(userId, body);
   }
 
   @Patch('posts/:id')
@@ -85,6 +100,7 @@ export class WallController {
     @Query('offset') offset?: string,
     @Query('tag') tag?: string,
     @Query('sort') sort?: string,
+    @Query('author') author?: string,
     @Headers('authorization') authorization?: string,
   ) {
     const parsedLimit = limit ? parseInt(limit, 10) : 20;
@@ -100,6 +116,7 @@ export class WallController {
       tag,
       sort,
       actorId,
+      author,
     );
   }
 
